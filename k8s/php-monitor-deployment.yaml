@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: net-identity-allocator-php-monitor
+  namespace: mac-allocator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: net-identity-allocator-php-monitor
+  template:
+    metadata:
+      labels:
+        app: net-identity-allocator-php-monitor
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: php-monitor
+          image: cmxsafemac-ipv6-php-monitor:docker-desktop-v2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+          env:
+            - name: MAC_ALLOCATOR_BASE_URL
+              value: http://net-identity-allocator.mac-allocator.svc.cluster.local:8080
+            - name: TRAFFIC_COLLECTOR_BASE_URL
+              value: http://cmxsafemac-ipv6-traffic-collector.mac-allocator.svc.cluster.local:8082
+            - name: SSH_DASHBOARD_BASE_URL
+              value: http://portable-openssh-dashboard.mac-ssh-demo.svc.cluster.local:8084
+            - name: EXPLICIT_IPV6_ROUTE_PREFIX_LEN
+              value: "16"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: net-identity-allocator-php-monitor
+  namespace: mac-allocator
+spec:
+  selector:
+    app: net-identity-allocator-php-monitor
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

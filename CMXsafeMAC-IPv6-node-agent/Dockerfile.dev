@@ -1,0 +1,19 @@
+FROM cmxsafemac-ipv6-node-agent:docker-desktop-v23
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        dnsutils \
+        iputils-ping \
+        jq \
+        less \
+        lsof \
+        net-tools \
+        procps \
+        strace \
+        vim-tiny \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY debug_tetragon.py /app/debug_tetragon.py
+
+CMD ["bash", "-lc", "trap : TERM INT; sleep infinity & wait"]

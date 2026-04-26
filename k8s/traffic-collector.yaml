@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cmxsafemac-ipv6-traffic-collector
+  namespace: mac-allocator
+spec:
+  selector:
+    matchLabels:
+      app: cmxsafemac-ipv6-traffic-collector
+  template:
+    metadata:
+      labels:
+        app: cmxsafemac-ipv6-traffic-collector
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: collector
+          image: cmxsafemac-ipv6-traffic-collector:docker-desktop-v1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8082
+              name: http
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: CAPTURE_INTERFACE
+              value: br-explicit-v6
+            - name: CAPTURE_FILTER
+              value: ip6
+            - name: COLLECTOR_HTTP_PORT
+              value: "8082"
+            - name: STREAM_RESTART_SECONDS
+              value: "3"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cmxsafemac-ipv6-traffic-collector
+  namespace: mac-allocator
+spec:
+  selector:
+    app: cmxsafemac-ipv6-traffic-collector
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http

@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mac-demo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo
+  namespace: mac-demo
+spec:
+  clusterIP: None
+  selector:
+    app: demo
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: demo
+  namespace: mac-demo
+spec:
+  serviceName: demo
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+        pods-mac-allocator/enabled: "true"
+      annotations:
+        k8s.v1.cni.cncf.io/networks: '[{"name":"explicit-v6-lan","interface":"net1"}]'
+        pods-mac-allocator/mac-dev: ipv6-derived-only
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["sh", "-c", "sleep 36000"]

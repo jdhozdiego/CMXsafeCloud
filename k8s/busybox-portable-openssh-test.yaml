@@ -1,0 +1,429 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mac-ssh-demo
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: explicit-v6-lan
+  namespace: mac-ssh-demo
+spec:
+  config: |
+    {
+      "cniVersion": "1.0.0",
+      "name": "explicit-v6-lan",
+      "type": "bridge",
+      "bridge": "br-explicit-v6",
+      "isGateway": false,
+      "ipMasq": false,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [
+          [
+            {
+              "subnet": "fd42:4242:ff::/64"
+            }
+          ]
+        ]
+      }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portable-openssh-etc
+  namespace: mac-ssh-demo
+data:
+  sshd_config: |
+    Port 2222
+    Protocol 2
+    ListenAddress 0.0.0.0
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    ChallengeResponseAuthentication no
+    PubkeyAuthentication yes
+    PermitRootLogin no
+    PermitEmptyPasswords no
+    HostKey /etc/ssh/ssh_host_ed25519_key
+    AuthorizedKeysFile .ssh/authorized_keys
+    PidFile /var/run/sshd.pid
+    UseDNS no
+    X11Forwarding no
+    AllowTcpForwarding yes
+    GatewayPorts clientspecified
+    PermitTunnel no
+    PrintMotd no
+    LogLevel VERBOSE
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portable-openssh-policy
+  namespace: mac-ssh-demo
+data:
+  ensure-canonical-ready.sh: |
+    #!/bin/sh
+    set -eu
+    username="${1:-}"
+    canonical_arg="${2:-}"
+    if [ -z "$username" ]; then
+      username="$(id -un 2>/dev/null || true)"
+    fi
+    normalized_username="$(printf '%s' "$username" | tr 'A-F' 'a-f')"
+    allocator_url="${ALLOCATOR_URL:-}"
+    pod_uid="${POD_UID:-}"
+    explicit_iface="${EXPLICIT_IFACE:-net1}"
+    wait_attempts="${SSH_CANONICAL_WAIT_ATTEMPTS:-20}"
+    wait_seconds="${SSH_CANONICAL_WAIT_SECONDS:-1}"
+
+    load_runtime_env() {
+      if [ -n "$allocator_url" ] && [ -n "$pod_uid" ]; then
+        return 0
+      fi
+      if [ -r /var/run/ssh-canonical.env ]; then
+        # shellcheck disable=SC1091
+        . /var/run/ssh-canonical.env
+        allocator_url="${ALLOCATOR_URL:-$allocator_url}"
+        pod_uid="${POD_UID:-$pod_uid}"
+        explicit_iface="${EXPLICIT_IFACE:-$explicit_iface}"
+        wait_attempts="${SSH_CANONICAL_WAIT_ATTEMPTS:-$wait_attempts}"
+        wait_seconds="${SSH_CANONICAL_WAIT_SECONDS:-$wait_seconds}"
+      fi
+    }
+
+    username_to_ipv6() {
+      value="$1"
+      printf '%s:%s:%s:%s:%s:%s:%s:%s' \
+        "$(printf '%s' "$value" | cut -c1-4)" \
+        "$(printf '%s' "$value" | cut -c5-8)" \
+        "$(printf '%s' "$value" | cut -c9-12)" \
+        "$(printf '%s' "$value" | cut -c13-16)" \
+        "$(printf '%s' "$value" | cut -c17-20)" \
+        "$(printf '%s' "$value" | cut -c21-24)" \
+        "$(printf '%s' "$value" | cut -c25-28)" \
+        "$(printf '%s' "$value" | cut -c29-32)"
+    }
+
+    ensure_canonical_ipv6() {
+      case "$normalized_username" in
+        "")
+          return 0
+          ;;
+        *[!0-9a-f]*)
+          return 0
+          ;;
+      esac
+      if [ "${#normalized_username}" -ne 32 ]; then
+        return 0
+      fi
+      load_runtime_env
+      if [ -z "$allocator_url" ] || [ -z "$pod_uid" ]; then
+        echo "canonical ssh session hook is missing allocator configuration" >&2
+        return 1
+      fi
+
+      requested_ipv6="$canonical_arg"
+      if [ -z "$requested_ipv6" ]; then
+        requested_ipv6="$(username_to_ipv6 "$normalized_username")"
+      fi
+      request_payload="$(printf '{"pod_uid":"%s","ipv6_address":"%s","container_iface":"%s"}' "$pod_uid" "$requested_ipv6" "$explicit_iface")"
+
+      assignment_json="$(wget -qO- \
+        --header='Content-Type: application/json' \
+        --post-data="$request_payload" \
+        "$allocator_url/explicit-ipv6-assignments/ensure")" || {
+          echo "failed to ensure canonical IPv6 for user $username on pod $pod_uid" >&2
+          return 1
+        }
+
+      requested_ipv6="$(printf '%s' "$assignment_json" | tr -d '\r\n' | sed -n 's/.*"requested_ipv6"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      if [ -z "$requested_ipv6" ]; then
+        echo "allocator did not return requested_ipv6 for user $username" >&2
+        return 1
+      fi
+
+      attempt=1
+      while [ "$attempt" -le "$wait_attempts" ]; do
+        status_json="$(wget -qO- "$allocator_url/explicit-ipv6-assignments?requested_ipv6=$requested_ipv6&status=ACTIVE" 2>/dev/null || true)"
+        compact_status="$(printf '%s' "$status_json" | tr -d '\r\n')"
+        if printf '%s' "$compact_status" | grep -Eq "\"pod_uid\"[[:space:]]*:[[:space:]]*\"$pod_uid\"" && printf '%s' "$compact_status" | grep -Eq "\"last_applied_at\"[[:space:]]*:[[:space:]]*\""; then
+          echo "CMXsafe canonical IPv6 $requested_ipv6 is ready on pod $pod_uid" >&2
+          return 0
+        fi
+        sleep "$wait_seconds"
+        attempt=$((attempt + 1))
+      done
+
+      echo "timed out waiting for canonical IPv6 $requested_ipv6 to apply on pod $pod_uid" >&2
+      return 1
+    }
+
+    if ! ensure_canonical_ipv6; then
+      exit 1
+    fi
+  forward-only.sh: |
+    #!/bin/sh
+    set -eu
+    username="$(id -un 2>/dev/null || true)"
+    if ! /opt/ssh-policy/ensure-canonical-ready.sh "$username"; then
+      exit 1
+    fi
+
+    if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+      echo "Remote command execution is disabled for this key." >&2
+      exit 1
+    fi
+    trap 'exit 0' TERM INT
+    while :
+    do
+      sleep 3600 &
+      wait $!
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portable-openssh-busybox
+  namespace: mac-ssh-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: portable-openssh-busybox
+  template:
+    metadata:
+      labels:
+        app: portable-openssh-busybox
+        pods-mac-allocator/enabled: "true"
+      annotations:
+        k8s.v1.cni.cncf.io/networks: '[{"name":"explicit-v6-lan","interface":"net1"}]'
+        pods-mac-allocator/mac-dev: ipv6-derived-only
+    spec:
+      containers:
+        - name: sshd
+          image: busybox:1.36
+          command:
+            - sh
+            - -lc
+            - |
+              set -eu
+              STAGED_OPENSSH_ROOT="${STAGED_OPENSSH_ROOT:-/opt/openssh}"
+              SEED_OPENSSH_ROOT="${SEED_OPENSSH_ROOT:-/seed-openssh}"
+              SSHD_BIN="${SSHD_BIN:-}"
+              for account_file in passwd group shadow
+              do
+                if [ -e "/external-etc/$account_file" ]; then
+                  rm -f "/etc/$account_file"
+                  ln -s "/external-etc/$account_file" "/etc/$account_file"
+                fi
+              done
+              if [ ! -x "$STAGED_OPENSSH_ROOT/sbin/sshd" ]; then
+                mkdir -p "$STAGED_OPENSSH_ROOT"
+                cp -R "$SEED_OPENSSH_ROOT"/. "$STAGED_OPENSSH_ROOT/"
+                chmod -R u+rwX,go+rX "$STAGED_OPENSSH_ROOT"
+                for binary_dir in \
+                  "$STAGED_OPENSSH_ROOT/bin" \
+                  "$STAGED_OPENSSH_ROOT/sbin" \
+                  "$STAGED_OPENSSH_ROOT/libexec"
+                do
+                  if [ -d "$binary_dir" ]; then
+                    find "$binary_dir" -type f -exec chmod 0555 {} \;
+                  fi
+                done
+              fi
+              if [ -z "$SSHD_BIN" ]; then
+                for candidate in \
+                  "$STAGED_OPENSSH_ROOT/sbin/sshd" \
+                  "$STAGED_OPENSSH_ROOT/bin/sshd" \
+                  "$STAGED_OPENSSH_ROOT/sshd" \
+                  /opt/openssh/sbin/sshd \
+                  /opt/openssh/bin/sshd \
+                  /opt/openssh/sshd
+                do
+                  if [ -x "$candidate" ]; then
+                    SSHD_BIN="$candidate"
+                    break
+                  fi
+                done
+              fi
+              if [ -z "$SSHD_BIN" ]; then
+                echo "portable sshd binary not found under /opt/openssh" >&2
+                exit 1
+              fi
+              mkdir -p /var/empty /var/run/sshd /tmp
+              chown 0:0 /var/empty
+              chmod 0755 /var/empty
+              {
+                printf "ALLOCATOR_URL='%s'\n" "${ALLOCATOR_URL:-}"
+                printf "POD_UID='%s'\n" "${POD_UID:-}"
+                printf "EXPLICIT_IFACE='%s'\n" "${EXPLICIT_IFACE:-net1}"
+                printf "SSH_CANONICAL_WAIT_ATTEMPTS='%s'\n" "${SSH_CANONICAL_WAIT_ATTEMPTS:-20}"
+                printf "SSH_CANONICAL_WAIT_SECONDS='%s'\n" "${SSH_CANONICAL_WAIT_SECONDS:-1}"
+                printf "CMXSAFE_CANONICAL_READY_HOOK='%s'\n" "${CMXSAFE_CANONICAL_READY_HOOK:-/opt/ssh-policy/ensure-canonical-ready.sh}"
+              } >/var/run/ssh-canonical.env
+              chmod 0644 /var/run/ssh-canonical.env
+              "$SSHD_BIN" -t -f /etc/ssh/sshd_config
+              exec "$SSHD_BIN" -D -e -f /etc/ssh/sshd_config
+          env:
+            - name: STAGED_OPENSSH_ROOT
+              value: /opt/openssh
+            - name: SEED_OPENSSH_ROOT
+              value: /seed-openssh
+            - name: EXPLICIT_IFACE
+              value: net1
+            - name: ALLOCATOR_URL
+              value: http://net-identity-allocator.mac-allocator.svc.cluster.local:8080
+            - name: SSH_CANONICAL_WAIT_ATTEMPTS
+              value: "30"
+            - name: SSH_CANONICAL_WAIT_SECONDS
+              value: "1"
+            - name: CMXSAFE_CANONICAL_READY_HOOK
+              value: /opt/ssh-policy/ensure-canonical-ready.sh
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - containerPort: 2222
+              name: ssh
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - DAC_OVERRIDE
+                - SETGID
+                - SETUID
+                - SYS_CHROOT
+              drop:
+                - ALL
+          volumeMounts:
+            - name: openssh-runtime
+              mountPath: /seed-openssh
+              subPath: opt/openssh
+              readOnly: true
+            - name: var-empty-live
+              mountPath: /var/empty
+            - name: openssh-etc
+              mountPath: /external-etc
+              readOnly: true
+            - name: ssh-etc
+              mountPath: /etc/ssh
+              readOnly: true
+            - name: ssh-policy
+              mountPath: /opt/ssh-policy
+              readOnly: true
+            - name: ssh-home
+              mountPath: /home
+              readOnly: true
+            - name: run-live
+              mountPath: /var/run
+            - name: tmp-live
+              mountPath: /tmp
+            - name: openssh-live
+              mountPath: /opt/openssh
+        - name: replica-traffic-collector
+          image: cmxsafemac-ipv6-traffic-collector:docker-desktop-v1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8083
+              name: replica-flows
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: CAPTURE_INTERFACE
+              value: any
+            - name: CAPTURE_FILTER
+              value: ip6
+            - name: COLLECTOR_HTTP_PORT
+              value: "8083"
+            - name: STREAM_RESTART_SECONDS
+              value: "3"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: replica-flows
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: replica-flows
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: openssh-runtime
+          persistentVolumeClaim:
+            claimName: portable-openssh-runtime
+            readOnly: true
+        - name: openssh-etc
+          persistentVolumeClaim:
+            claimName: portable-openssh-etc
+            readOnly: true
+        - name: ssh-etc
+          projected:
+            defaultMode: 0600
+            sources:
+              - configMap:
+                  name: portable-openssh-etc
+              - secret:
+                  name: portable-openssh-host-keys
+        - name: ssh-policy
+          configMap:
+            name: portable-openssh-policy
+            defaultMode: 0555
+        - name: ssh-home
+          persistentVolumeClaim:
+            claimName: portable-openssh-home
+            readOnly: true
+        - name: run-live
+          emptyDir: {}
+        - name: tmp-live
+          emptyDir: {}
+        - name: openssh-live
+          emptyDir: {}
+        - name: var-empty-live
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portable-openssh-busybox
+  namespace: mac-ssh-demo
+spec:
+  selector:
+    app: portable-openssh-busybox
+  ports:
+    - name: ssh
+      port: 2222
+      targetPort: ssh
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portable-openssh-busybox-external
+  namespace: mac-ssh-demo
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+  selector:
+    app: portable-openssh-busybox
+  ports:
+    - name: ssh
+      port: 2222
+      targetPort: ssh

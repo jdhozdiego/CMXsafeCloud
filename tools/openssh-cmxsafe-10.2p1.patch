@@ -1,0 +1,573 @@
+diff --git a/channels.c b/channels.c
+index 80014ff..f17ff16 100644
+--- a/channels.c
++++ b/channels.c
+@@ -56,6 +56,7 @@
+ #include <limits.h>
+ #include <netdb.h>
+ #include <poll.h>
++#include <pwd.h>
+ #include <stdarg.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -77,6 +78,7 @@
+ #include "compat.h"
+ #include "canohost.h"
+ #include "sshkey.h"
++#include "atomicio.h"
+ #include "authfd.h"
+ #include "pathnames.h"
+ #include "match.h"
+@@ -84,6 +86,9 @@
+ /* XXX remove once we're satisfied there's no lurking bugs */
+ /* #define DEBUG_CHANNEL_POLL 1 */
+ 
++#define CMXSAFE_ENDPOINTD_SOCK_ENV "CMXSAFE_ENDPOINTD_SOCK"
++#define CMXSAFE_OWNER_ID_LEN 128
++
+ /* -- agent forwarding */
+ #define	NUM_SOCKS	10
+ 
+@@ -221,6 +226,180 @@ static int connect_next(struct channel_connect *);
+ static void channel_connect_ctx_free(struct channel_connect *);
+ static Channel *rdynamic_connect_prepare(struct ssh *, char *, char *);
+ static int rdynamic_connect_finish(struct ssh *, Channel *);
++static int channel_connect_bind_source(int, const struct channel_connect *);
++
++static int
++cmxsafe_is_loopback_host(const char *host)
++{
++	return host != NULL &&
++	    (strcmp(host, "::1") == 0 || strcmp(host, "127.0.0.1") == 0);
++}
++
++static int
++cmxsafe_user_to_ipv6(char *buf, size_t buflen)
++{
++	struct passwd *pw;
++	char canonical[33];
++	size_t i;
++
++	if (buflen < 40)
++		return -1;
++	if ((pw = getpwuid(geteuid())) == NULL || pw->pw_name == NULL)
++		return -1;
++	if (strlen(pw->pw_name) != 32)
++		return -1;
++	for (i = 0; i < 32; i++) {
++		char ch = pw->pw_name[i];
++
++		if (ch >= 'A' && ch <= 'F')
++			ch = ch - 'A' + 'a';
++		if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')))
++			return -1;
++		canonical[i] = ch;
++	}
++	canonical[32] = '\0';
++	snprintf(buf, buflen, "%.*s:%.*s:%.*s:%.*s:%.*s:%.*s:%.*s:%.*s",
++	    4, canonical + 0, 4, canonical + 4, 4, canonical + 8,
++	    4, canonical + 12, 4, canonical + 16, 4, canonical + 20,
++	    4, canonical + 24, 4, canonical + 28);
++	return 0;
++}
++
++static int
++cmxsafe_resolve_bind_host(const struct channel_connect *cctx,
++    char *bind_host, size_t bind_host_len, const char **scopep)
++{
++	struct in6_addr addr;
++
++	if (scopep != NULL)
++		*scopep = "peer";
++	if (cctx == NULL || bind_host == NULL || bind_host_len == 0 ||
++	    cctx->host_orig == NULL || *cctx->host_orig == '\0')
++		return 0;
++	if (cmxsafe_is_loopback_host(cctx->host)) {
++		if (inet_pton(AF_INET6, cctx->host_orig, &addr) != 1)
++			return 0;
++		strlcpy(bind_host, cctx->host_orig, bind_host_len);
++		return 1;
++	}
++	if (cmxsafe_user_to_ipv6(bind_host, bind_host_len) != 0) {
++		debug2_f("unable to derive canonical IPv6 from current user");
++		return 0;
++	}
++	if (scopep != NULL)
++		*scopep = "self";
++	return 1;
++}
++
++static int
++cmxsafe_endpointd_ensure(const char *scope, const char *ipv6, u_int port_orig,
++    int sock)
++{
++	const char *sock_path;
++	struct sockaddr_un sunaddr;
++	char request[256], response[256], owner_id[CMXSAFE_OWNER_ID_LEN];
++	size_t used = 0;
++	ssize_t nr;
++	int fd = -1, ok = -1;
++
++	if ((sock_path = getenv(CMXSAFE_ENDPOINTD_SOCK_ENV)) == NULL ||
++	    *sock_path == '\0')
++		return 0;
++	if (strlen(sock_path) >= sizeof(sunaddr.sun_path)) {
++		error_f("endpoint helper socket path is too long");
++		return -1;
++	}
++	if (snprintf(owner_id, sizeof(owner_id), "%s:pid:%ld:port:%u:fd:%d",
++	    scope != NULL ? scope : "peer", (long)getpid(), port_orig, sock) >=
++	    (int)sizeof(owner_id)) {
++		error_f("failed to format endpoint helper owner id");
++		return -1;
++	}
++	if (snprintf(request, sizeof(request), "ensure\t%s\t%s\t%s\n",
++	    scope != NULL ? scope : "peer", owner_id, ipv6) >=
++	    (int)sizeof(request)) {
++		error_f("endpoint helper request would overflow");
++		return -1;
++	}
++	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
++		error_f("socket(AF_UNIX): %s", strerror(errno));
++		return -1;
++	}
++	memset(&sunaddr, 0, sizeof(sunaddr));
++	sunaddr.sun_family = AF_UNIX;
++	strlcpy(sunaddr.sun_path, sock_path, sizeof(sunaddr.sun_path));
++	if (connect(fd, (struct sockaddr *)&sunaddr, sizeof(sunaddr)) == -1) {
++		error_f("connect(%s): %s", sock_path, strerror(errno));
++		goto out;
++	}
++	if (atomicio(vwrite, fd, request, strlen(request)) != strlen(request)) {
++		error_f("endpoint helper write failed: %s", strerror(errno));
++		goto out;
++	}
++	memset(response, 0, sizeof(response));
++	while (used < sizeof(response) - 1) {
++		nr = read(fd, response + used, sizeof(response) - 1 - used);
++		if (nr == -1) {
++			if (errno == EINTR)
++				continue;
++			error_f("endpoint helper read failed: %s", strerror(errno));
++			goto out;
++		}
++		if (nr == 0)
++			break;
++		used += (size_t)nr;
++		if (response[used - 1] == '\n')
++			break;
++	}
++	if (strstr(response, "\"ok\": true") == NULL &&
++	    strstr(response, "\"ok\":true") == NULL) {
++		error_f("endpoint helper rejected ensure for %s: %s",
++		    ipv6, response);
++		goto out;
++	}
++	ok = 0;
++ out:
++	if (fd != -1)
++		close(fd);
++	return ok;
++}
++
++static int
++channel_connect_bind_source(int sock, const struct channel_connect *cctx)
++{
++	struct sockaddr_in6 bind_addr;
++	char bind_host[INET6_ADDRSTRLEN];
++	const char *scope = "peer";
++	int on = 1;
++
++	if (cctx == NULL || cctx->ai == NULL || cctx->ai->ai_family != AF_INET6 ||
++	    cctx->port_orig == 0)
++		return 0;
++	if (!cmxsafe_resolve_bind_host(cctx, bind_host, sizeof(bind_host), &scope))
++		return 0;
++	if (cmxsafe_endpointd_ensure(scope, bind_host, cctx->port_orig, sock) != 0)
++		return -1;
++	memset(&bind_addr, 0, sizeof(bind_addr));
++	bind_addr.sin6_family = AF_INET6;
++	bind_addr.sin6_port = htons(cctx->port_orig);
++	if (inet_pton(AF_INET6, bind_host, &bind_addr.sin6_addr) != 1) {
++		error_f("invalid bind host %s", bind_host);
++		errno = EINVAL;
++		return -1;
++	}
++	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) == -1) {
++		error_f("setsockopt(SO_REUSEADDR): %s", strerror(errno));
++		return -1;
++	}
++	if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == -1) {
++		error_f("bind([%s]:%u): %s", bind_host, cctx->port_orig,
++		    strerror(errno));
++		return -1;
++	}
++	debug2_f("bound forwarding source to [%s]:%u (%s)",
++	    bind_host, cctx->port_orig, scope);
++	return 0;
++}
+ 
+ /* Setup helper */
+ static void channel_handler_init(struct ssh_channels *sc);
+@@ -4687,6 +4866,12 @@ connect_next(struct channel_connect *cctx)
+ 				verbose("socket: %.100s", strerror(errno));
+ 			continue;
+ 		}
++		if (channel_connect_bind_source(sock, cctx) == -1) {
++			saved_errno = errno;
++			close(sock);
++			errno = saved_errno;
++			continue;
++		}
+ 		if (set_nonblock(sock) == -1)
+ 			fatal_f("set_nonblock(%d)", sock);
+ 		if (connect(sock, cctx->ai->ai_addr,
+@@ -4712,6 +4897,7 @@ static void
+ channel_connect_ctx_free(struct channel_connect *cctx)
+ {
+ 	free(cctx->host);
++	free(cctx->host_orig);
+ 	if (cctx->aitop) {
+ 		if (cctx->aitop->ai_family == AF_UNIX)
+ 			free(cctx->aitop);
+@@ -4792,13 +4978,15 @@ connect_to_helper(struct ssh *ssh, const char *name, int port, int socktype,
+ /* Return CONNECTING channel to remote host:port or local socket path */
+ static Channel *
+ connect_to(struct ssh *ssh, const char *host, int port,
+-    char *ctype, char *rname)
++    char *ctype, char *rname, const char *host_orig, u_int port_orig)
+ {
+ 	struct channel_connect cctx;
+ 	Channel *c;
+ 	int sock;
+ 
+ 	memset(&cctx, 0, sizeof(cctx));
++	cctx.host_orig = host_orig == NULL ? NULL : xstrdup(host_orig);
++	cctx.port_orig = port_orig;
+ 	sock = connect_to_helper(ssh, host, port, SOCK_STREAM, ctype, rname,
+ 	    &cctx, NULL, NULL);
+ 	if (sock == -1) {
+@@ -4820,7 +5008,8 @@ connect_to(struct ssh *ssh, const char *host, int port,
+  */
+ Channel *
+ channel_connect_by_listen_address(struct ssh *ssh, const char *listen_host,
+-    u_short listen_port, char *ctype, char *rname)
++    u_short listen_port, char *ctype, char *rname, const char *host_orig,
++    u_short port_orig)
+ {
+ 	struct ssh_channels *sc = ssh->chanctxt;
+ 	struct permission_set *pset = &sc->local_perms;
+@@ -4838,7 +5027,7 @@ channel_connect_by_listen_address(struct ssh *ssh, const char *listen_host,
+ 				    ctype, rname);
+ 			return connect_to(ssh,
+ 			    perm->host_to_connect, perm->port_to_connect,
+-			    ctype, rname);
++			    ctype, rname, host_orig, port_orig);
+ 		}
+ 	}
+ 	error("WARNING: Server requests forwarding for unknown listen_port %d",
+@@ -4860,7 +5049,7 @@ channel_connect_by_listen_path(struct ssh *ssh, const char *path,
+ 		if (open_listen_match_streamlocal(perm, path)) {
+ 			return connect_to(ssh,
+ 			    perm->host_to_connect, perm->port_to_connect,
+-			    ctype, rname);
++			    ctype, rname, NULL, 0);
+ 		}
+ 	}
+ 	error("WARNING: Server requests forwarding for unknown path %.100s",
+@@ -4871,7 +5060,8 @@ channel_connect_by_listen_path(struct ssh *ssh, const char *path,
+ /* Check if connecting to that port is permitted and connect. */
+ Channel *
+ channel_connect_to_port(struct ssh *ssh, const char *host, u_short port,
+-    char *ctype, char *rname, int *reason, const char **errmsg)
++    const char *host_orig, u_short port_orig, char *ctype, char *rname,
++    int *reason, const char **errmsg)
+ {
+ 	struct ssh_channels *sc = ssh->chanctxt;
+ 	struct permission_set *pset = &sc->local_perms;
+@@ -4913,6 +5103,8 @@ channel_connect_to_port(struct ssh *ssh, const char *host, u_short port,
+ 	}
+ 
+ 	memset(&cctx, 0, sizeof(cctx));
++	cctx.host_orig = host_orig == NULL ? NULL : xstrdup(host_orig);
++	cctx.port_orig = port_orig;
+ 	sock = connect_to_helper(ssh, host, port, SOCK_STREAM, ctype, rname,
+ 	    &cctx, reason, errmsg);
+ 	if (sock == -1) {
+@@ -4966,7 +5158,7 @@ channel_connect_to_path(struct ssh *ssh, const char *path,
+ 		    "but the request was denied.", path);
+ 		return NULL;
+ 	}
+-	return connect_to(ssh, path, PORT_STREAMLOCAL, ctype, rname);
++	return connect_to(ssh, path, PORT_STREAMLOCAL, ctype, rname, NULL, 0);
+ }
+ 
+ void
+diff --git a/channels.h b/channels.h
+index 7456541..0e11f56 100644
+--- a/channels.h
++++ b/channels.h
+@@ -112,6 +112,8 @@ TAILQ_HEAD(channel_confirms, channel_confirm);
+ struct channel_connect {
+ 	char *host;
+ 	int port;
++	char *host_orig;
++	u_int port_orig;
+ 	struct addrinfo *ai, *aitop;
+ };
+ 
+@@ -366,12 +368,12 @@ void	 channel_clear_permission(struct ssh *, int, int);
+ void	 channel_disable_admin(struct ssh *, int);
+ void	 channel_update_permission(struct ssh *, int, int);
+ Channel	*channel_connect_to_port(struct ssh *, const char *, u_short,
+-	    char *, char *, int *, const char **);
++	    const char *, u_short, char *, char *, int *, const char **);
+ Channel *channel_connect_to_path(struct ssh *, const char *, char *, char *);
+ Channel	*channel_connect_stdio_fwd(struct ssh *, const char*,
+ 	    int, int, int, int);
+ Channel	*channel_connect_by_listen_address(struct ssh *, const char *,
+-	    u_short, char *, char *);
++	    u_short, char *, char *, const char *, u_short);
+ Channel	*channel_connect_by_listen_path(struct ssh *, const char *,
+ 	    char *, char *);
+ int	 channel_request_remote_forwarding(struct ssh *, struct Forward *);
+diff --git a/clientloop.c b/clientloop.c
+index 49d048d..efae07d 100644
+--- a/clientloop.c
++++ b/clientloop.c
+@@ -1731,7 +1731,7 @@ client_request_forwarded_tcpip(struct ssh *ssh, const char *request_type,
+ 	else {
+ 		c = channel_connect_by_listen_address(ssh,
+ 		    listen_address, listen_port, "forwarded-tcpip",
+-		    originator_address);
++		    originator_address, originator_address, originator_port);
+ 	}
+ 
+ 	if (c != NULL && c->type == SSH_CHANNEL_MUX_CLIENT) {
+diff --git a/serverloop.c b/serverloop.c
+index 5d3b194..705c5d7 100644
+--- a/serverloop.c
++++ b/serverloop.c
+@@ -42,6 +42,7 @@
+ #include <sys/socket.h>
+ #include <sys/time.h>
+ 
++#include <arpa/inet.h>
+ #include <netinet/in.h>
+ 
+ #include <errno.h>
+@@ -50,6 +51,7 @@
+ #include <limits.h>
+ #include <poll.h>
+ #include <signal.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <termios.h>
+ #include <unistd.h>
+@@ -94,6 +96,118 @@ static void server_init_dispatch(struct ssh *);
+ /* requested tunnel forwarding interface(s), shared with session.c */
+ char *tun_fwd_ifnames = NULL;
+ 
++static int cmxsafe_canonical_ready = 0;
++
++static int
++cmxsafe_user_to_ipv6(const struct passwd *pw, char *buf, size_t buflen,
++    struct in6_addr *addrp)
++{
++	char canonical[33];
++	size_t i;
++
++	if (pw == NULL || pw->pw_name == NULL || buf == NULL ||
++	    strlen(pw->pw_name) != 32 || buflen < INET6_ADDRSTRLEN)
++		return -1;
++	for (i = 0; i < 32; i++) {
++		char ch = pw->pw_name[i];
++
++		if (ch >= 'A' && ch <= 'F')
++			ch = ch - 'A' + 'a';
++		if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')))
++			return -1;
++		canonical[i] = ch;
++	}
++	canonical[32] = '\0';
++	snprintf(buf, buflen, "%.*s:%.*s:%.*s:%.*s:%.*s:%.*s:%.*s:%.*s",
++	    4, canonical + 0, 4, canonical + 4, 4, canonical + 8,
++	    4, canonical + 12, 4, canonical + 16, 4, canonical + 20,
++	    4, canonical + 24, 4, canonical + 28);
++	if (addrp != NULL && inet_pton(AF_INET6, buf, addrp) != 1)
++		return -1;
++	return 0;
++}
++
++static int
++cmxsafe_rfwd_listen_matches_user(const struct passwd *pw,
++    const char *listen_host, char *canonical, size_t canonical_len)
++{
++	struct in6_addr expected, requested;
++
++	if (cmxsafe_user_to_ipv6(pw, canonical, canonical_len, &expected) != 0)
++		return 1;
++	if (listen_host == NULL || *listen_host == '\0' ||
++	    strcmp(listen_host, "*") == 0 ||
++	    strcmp(listen_host, "localhost") == 0)
++		return 0;
++	if (inet_pton(AF_INET6, listen_host, &requested) != 1)
++		return 0;
++	return memcmp(&expected, &requested, sizeof(expected)) == 0;
++}
++
++static int
++cmxsafe_ensure_canonical_ready(struct ssh *ssh, const struct passwd *pw)
++{
++	char canonical[INET6_ADDRSTRLEN], *hook, *argv[4];
++	struct in6_addr addr;
++	pid_t pid;
++	int required = 0, status;
++
++	if (cmxsafe_canonical_ready)
++		return 0;
++	if (cmxsafe_user_to_ipv6(pw, canonical, sizeof(canonical), &addr) != 0)
++		return 0;
++
++	hook = getenv("CMXSAFE_CANONICAL_READY_HOOK");
++	if (hook != NULL && *hook != '\0')
++		required = 1;
++	else
++		hook = "/opt/ssh-policy/ensure-canonical-ready.sh";
++	if (access(hook, X_OK) != 0) {
++		if (required) {
++			error("CMXsafe canonical readiness hook %.200s is not "
++			    "executable: %s", hook, strerror(errno));
++			ssh_packet_send_debug(ssh, "CMXsafe canonical IPv6 "
++			    "readiness hook is not available.");
++			return -1;
++		}
++		debug3("CMXsafe canonical readiness hook %.200s is not "
++		    "available; forwarding without server-side wait", hook);
++		cmxsafe_canonical_ready = 1;
++		return 0;
++	}
++
++	debug("CMXsafe waiting for canonical IPv6 %.100s for user %.100s",
++	    canonical, pw->pw_name);
++	switch ((pid = fork())) {
++	case -1:
++		error("fork CMXsafe canonical readiness hook: %s",
++		    strerror(errno));
++		return -1;
++	case 0:
++		argv[0] = hook;
++		argv[1] = pw->pw_name;
++		argv[2] = canonical;
++		argv[3] = NULL;
++		execv(hook, argv);
++		_exit(127);
++	}
++	while (waitpid(pid, &status, 0) == -1) {
++		if (errno == EINTR)
++			continue;
++		error("wait CMXsafe canonical readiness hook: %s",
++		    strerror(errno));
++		return -1;
++	}
++	if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
++		cmxsafe_canonical_ready = 1;
++		return 0;
++	}
++	error("CMXsafe canonical readiness hook failed for user %.100s",
++	    pw->pw_name);
++	ssh_packet_send_debug(ssh, "CMXsafe canonical IPv6 is not ready.");
++	return -1;
++}
++
+ static void
+ sigchld_handler(int sig)
+ {
+@@ -417,6 +531,7 @@ server_request_direct_tcpip(struct ssh *ssh, int *reason, const char **errmsg)
+ 	Channel *c = NULL;
+ 	char *target = NULL, *originator = NULL;
+ 	u_int target_port = 0, originator_port = 0;
++	struct passwd *pw = the_authctxt->pw;
+ 	int r;
+ 
+ 	if ((r = sshpkt_get_cstring(ssh, &target, NULL)) != 0 ||
+@@ -443,8 +558,19 @@ server_request_direct_tcpip(struct ssh *ssh, int *reason, const char **errmsg)
+ 	if ((options.allow_tcp_forwarding & FORWARD_LOCAL) != 0 &&
+ 	    auth_opts->permit_port_forwarding_flag &&
+ 	    !options.disable_forwarding) {
+-		c = channel_connect_to_port(ssh, target, target_port,
+-		    "direct-tcpip", "direct-tcpip", reason, errmsg);
++		if (cmxsafe_ensure_canonical_ready(ssh, pw) != 0) {
++			logit("refused local port forward for user %.100s: "
++			    "CMXsafe canonical IPv6 is not ready",
++			    pw == NULL ? "(unknown)" : pw->pw_name);
++			if (reason != NULL)
++				*reason = SSH2_OPEN_ADMINISTRATIVELY_PROHIBITED;
++			if (errmsg != NULL)
++				*errmsg = "CMXsafe canonical IPv6 is not ready";
++		} else {
++			c = channel_connect_to_port(ssh, target, target_port,
++			    originator, originator_port, "direct-tcpip",
++			    "direct-tcpip", reason, errmsg);
++		}
+ 	} else {
+ 		logit("refused local port forward: "
+ 		    "originator %s port %d, target %s port %d",
+@@ -752,6 +878,7 @@ static int
+ server_input_global_request(int type, u_int32_t seq, struct ssh *ssh)
+ {
+ 	char *rtype = NULL;
++	char canonical_listen_host[INET6_ADDRSTRLEN];
+ 	u_char want_reply = 0;
+ 	int r, success = 0, allocated_listen_port = 0;
+ 	u_int port = 0;
+@@ -778,13 +905,29 @@ server_input_global_request(int type, u_int32_t seq, struct ssh *ssh)
+ 		if (port <= INT_MAX)
+ 			fwd.listen_port = (int)port;
+ 		/* check permissions */
+-		if (port > INT_MAX ||
++		if (!cmxsafe_rfwd_listen_matches_user(pw, fwd.listen_host,
++		    canonical_listen_host, sizeof(canonical_listen_host))) {
++			success = 0;
++			logit("refused CMXsafe remote forward for user %.100s: "
++			    "requested listen %.100s port %u instead of %.100s",
++			    pw->pw_name, fwd.listen_host == NULL ? "(null)" :
++			    fwd.listen_host, port, canonical_listen_host);
++			ssh_packet_send_debug(ssh, "CMXsafe remote forwarding "
++			    "requires the authenticated canonical IPv6 listen "
++			    "address.");
++		} else if (port > INT_MAX ||
+ 		    (options.allow_tcp_forwarding & FORWARD_REMOTE) == 0 ||
+ 		    !auth_opts->permit_port_forwarding_flag ||
+ 		    options.disable_forwarding ||
+ 		    (!want_reply && fwd.listen_port == 0)) {
+ 			success = 0;
+ 			ssh_packet_send_debug(ssh, "Server has disabled port forwarding.");
++		} else if (cmxsafe_ensure_canonical_ready(ssh, pw) != 0) {
++			success = 0;
++			logit("refused remote port forward for user %.100s: "
++			    "CMXsafe canonical IPv6 is not ready", pw->pw_name);
++			ssh_packet_send_debug(ssh, "CMXsafe canonical IPv6 "
++			    "is not ready.");
+ 		} else {
+ 			/* Start listening on the port */
+ 			success = channel_setup_remote_fwd_listener(ssh, &fwd,
+@@ -804,7 +947,17 @@ server_input_global_request(int type, u_int32_t seq, struct ssh *ssh)
+ 		    fwd.listen_host, port);
+ 		if (port <= INT_MAX) {
+ 			fwd.listen_port = (int)port;
+-			success = channel_cancel_rport_listener(ssh, &fwd);
++			if (cmxsafe_rfwd_listen_matches_user(pw,
++			    fwd.listen_host, canonical_listen_host,
++			    sizeof(canonical_listen_host))) {
++				success = channel_cancel_rport_listener(ssh, &fwd);
++			} else {
++				logit("refused CMXsafe remote forward cancel for "
++				    "user %.100s: requested listen %.100s port %u "
++				    "instead of %.100s", pw->pw_name,
++				    fwd.listen_host == NULL ? "(null)" :
++				    fwd.listen_host, port, canonical_listen_host);
++			}
+ 		}
+ 	} else if (strcmp(rtype, "streamlocal-forward@openssh.com") == 0) {
+ 		if ((r = sshpkt_get_cstring(ssh, &fwd.listen_path, NULL)) != 0)

@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BIN_ROOT="${CMXSAFE_BUNDLE_BIN_ROOT:-$ROOT/bin}"
+PYTHON_BIN="${PYTHON:-python3}"
+CHECK_INTERVAL="${CMXSAFE_CONNECT_CHECK_INTERVAL:-15}"
+RECONNECT_DELAY="${CMXSAFE_RECONNECT_DELAY:-5}"
+
+cleanup() {
+  "$PYTHON_BIN" "$BIN_ROOT/bundlectl.py" disconnect "$ROOT/config.json" >/dev/null 2>&1 || true
+}
+
+trap cleanup INT TERM EXIT
+
+while true
+do
+  echo "CMXsafe run-forever: connecting bundle" >&2
+  if "$PYTHON_BIN" "$BIN_ROOT/bundlectl.py" connect "$ROOT/config.json"; then
+    :
+  else
+    echo "CMXsafe run-forever: connect failed; retrying in ${RECONNECT_DELAY}s" >&2
+    sleep "$RECONNECT_DELAY"
+    continue
+  fi
+
+  while "$PYTHON_BIN" "$BIN_ROOT/bundlectl.py" status "$ROOT/config.json" >/dev/null 2>&1
+  do
+    sleep "$CHECK_INTERVAL"
+  done
+
+  echo "CMXsafe run-forever: session unhealthy; reconnecting in ${RECONNECT_DELAY}s" >&2
+  "$PYTHON_BIN" "$BIN_ROOT/bundlectl.py" disconnect "$ROOT/config.json" >/dev/null 2>&1 || true
+  sleep "$RECONNECT_DELAY"
+done

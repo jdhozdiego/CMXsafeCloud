@@ -1,0 +1,6 @@
+tetragon:
+  grpc:
+    enabled: true
+    address: unix:///var/run/cilium/tetragon/tetragon.sock
+  podAnnotations:
+    enabled: true

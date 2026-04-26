@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cmxsafemac-ipv6-node-agent-toolbox
+  namespace: mac-allocator
+spec:
+  selector:
+    matchLabels:
+      app: cmxsafemac-ipv6-node-agent-toolbox
+  template:
+    metadata:
+      labels:
+        app: cmxsafemac-ipv6-node-agent-toolbox
+    spec:
+      serviceAccountName: cmxsafemac-ipv6-node-agent
+      hostPID: true
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: toolbox
+          image: cmxsafemac-ipv6-node-agent-dev:docker-desktop-v2
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: ALLOCATOR_URL
+              value: http://net-identity-allocator.mac-allocator.svc.cluster.local:8080
+            - name: GW_IFACE
+              value: eth0
+            - name: MANAGED_IFACE
+              value: eth0
+            - name: EXPLICIT_IFACE
+              value: net1
+            - name: MANAGED_IPV6_PREFIX
+              value: fd42:4242:4242:10::/64
+            - name: SELECTOR_KEY
+              value: pods-mac-allocator/enabled
+            - name: SELECTOR_VALUE
+              value: "true"
+            - name: HOST_SYS_PATH
+              value: /host-sys
+            - name: CONTAINER_RUNTIME_ENDPOINT
+              value: unix:///host-run/containerd/containerd.sock
+            - name: TETRAGON_GRPC_ADDRESS
+              value: unix:///var/run/cilium/tetragon/tetragon.sock
+            - name: STREAM_RESTART_SECONDS
+              value: "3"
+            - name: SAFETY_RECONCILE_SECONDS
+              value: "15"
+            - name: AGENT_HTTP_PORT
+              value: "8081"
+            - name: EXPLICIT_IPV6_ROUTE_PREFIX_LEN
+              value: "16"
+          volumeMounts:
+            - name: host-sys
+              mountPath: /host-sys
+              readOnly: true
+            - name: host-run-containerd
+              mountPath: /host-run/containerd
+              readOnly: true
+            - name: host-run-tetragon
+              mountPath: /var/run/cilium/tetragon
+              readOnly: true
+      volumes:
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-run-containerd
+          hostPath:
+            path: /run/containerd
+            type: Directory
+        - name: host-run-tetragon
+          hostPath:
+            path: /var/run/cilium/tetragon
+            type: Directory

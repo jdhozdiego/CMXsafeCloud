@@ -1,0 +1,105 @@
+site_name: CMXsafeMAC-IPv6
+site_description: Deterministic MAC, canonical IPv6, and multi-replica SSH forwarding rendezvous documentation.
+repo_url: https://github.com/cmxsafe/CMXsafeMAC-IPv6
+site_url: https://cmxsafe.github.io/CMXsafeMAC-IPv6/
+edit_uri: edit/main/
+exclude_docs: README.md
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - .
+          options:
+            show_root_heading: true
+            show_root_toc_entry: true
+            show_root_full_path: false
+            show_source: false
+            show_if_no_docstring: true
+            show_signature_annotations: true
+            members_order: source
+            filters:
+              - "!^_"
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.inlinehilite
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_javascript:
+  - https://unpkg.com/mermaid@10.9.1/dist/mermaid.min.js
+  - javascripts/mermaid-init.js
+
+watch:
+  - docs
+  - docs_api
+  - k8s
+  - net-identity-allocator
+  - CMXsafeMAC-IPv6-node-agent
+  - CMXsafeMAC-IPv6-ssh-dashboard
+  - CMXsafeMAC-IPv6-traffic-collector
+
+nav:
+  - Home: index.md
+  - Overview:
+      - System Overview: system-overview.md
+      - Architecture: CMXsafeMAC-IPv6-architecture.md
+      - Deployment And Samples: deployment-and-samples.md
+      - External Endpoint Rollout: external-endpoint-rollout.md
+  - Identity And Flow:
+      - Apply And Move Pipeline: explicit-ipv6-apply-move-pipeline.md
+      - Parallelism: explicit-ipv6-parallelism.md
+      - Portable OpenSSH: busybox-portable-openssh.md
+      - SSH Dashboard: portable-openssh-dashboard.md
+      - Canonical SSH Routing: portable-openssh-canonical-routing.md
+      - Secure Path Observer: secure-path-observer-model.md
+  - Tests:
+      - Tests Overview: tests/index.md
+      - IoT Fan-Out Testbed: tests/portable-openssh-iot-fanout-testbed.md
+  - Components:
+      - Allocator: net-identity-allocator.md
+      - Node Agent: CMXsafeMAC-IPv6-node-agent.md
+      - Kubernetes Manifests: kubernetes-manifests.md
+  - Reference:
+      - Reference Home: reference/index.md
+      - Python API:
+          - Python API Overview: reference/python/index.md
+          - Allocator API Module: reference/python/allocator.md
+          - Node Agent Module: reference/python/node-agent.md
+          - SSH Dashboard Module: reference/python/ssh-dashboard.md
+          - Traffic Collector Module: reference/python/traffic-collector.md
+      - Kubernetes Manifests:
+          - Manifest Inventory: reference/manifests/index.md
+
+validation:
+  links:
+    not_found: ignore
+    absolute_links: ignore
+    unrecognized_links: ignore

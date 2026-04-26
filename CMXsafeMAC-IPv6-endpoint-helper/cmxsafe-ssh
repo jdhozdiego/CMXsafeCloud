@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ENDPOINTD_SCRIPT="${CMXSAFE_ENDPOINTD_SCRIPT:-$SCRIPT_DIR/endpointd.py}"
+SOCKET_PATH="${CMXSAFE_ENDPOINTD_SOCK:-/var/run/cmxsafe-endpointd.sock}"
+PYTHON_BIN="${CMXSAFE_ENDPOINTD_PYTHON:-python3}"
+SSH_BIN="${CMXSAFE_SSH_BIN:-ssh}"
+USER_NAME="${CMXSAFE_CANONICAL_USER:-$(id -un)}"
+OWNER_ID="session:pid:$$:started:$(date +%s)"
+
+normalise_user_to_ipv6() {
+    value=$(printf '%s' "$1" | tr 'A-F' 'a-f')
+    case "$value" in
+        *[!0-9a-f]*)
+            return 1
+            ;;
+    esac
+    if [ "${#value}" -ne 32 ]; then
+        return 1
+    fi
+    printf '%s:%s:%s:%s:%s:%s:%s:%s' \
+        "$(printf '%s' "$value" | cut -c1-4)" \
+        "$(printf '%s' "$value" | cut -c5-8)" \
+        "$(printf '%s' "$value" | cut -c9-12)" \
+        "$(printf '%s' "$value" | cut -c13-16)" \
+        "$(printf '%s' "$value" | cut -c17-20)" \
+        "$(printf '%s' "$value" | cut -c21-24)" \
+        "$(printf '%s' "$value" | cut -c25-28)" \
+        "$(printf '%s' "$value" | cut -c29-32)"
+}
+
+if ! CANONICAL_IPV6=$(normalise_user_to_ipv6 "$USER_NAME"); then
+    echo "cmxsafe-ssh requires a 32-hex canonical username or CMXSAFE_CANONICAL_USER override" >&2
+    exit 1
+fi
+
+cleanup() {
+    "$PYTHON_BIN" "$ENDPOINTD_SCRIPT" release \
+        --socket "$SOCKET_PATH" \
+        --scope self \
+        --owner "$OWNER_ID" \
+        --ipv6 "$CANONICAL_IPV6" >/dev/null 2>&1 || true
+}
+
+trap cleanup EXIT INT TERM
+
+"$PYTHON_BIN" "$ENDPOINTD_SCRIPT" ping --socket "$SOCKET_PATH" >/dev/null
+"$PYTHON_BIN" "$ENDPOINTD_SCRIPT" ensure \
+    --socket "$SOCKET_PATH" \
+    --scope self \
+    --owner "$OWNER_ID" \
+    --ipv6 "$CANONICAL_IPV6" >/dev/null
+
+export CMXSAFE_ENDPOINTD_SOCK="$SOCKET_PATH"
+export CMXSAFE_CANONICAL_IPV6="$CANONICAL_IPV6"
+
+"$SSH_BIN" "$@"

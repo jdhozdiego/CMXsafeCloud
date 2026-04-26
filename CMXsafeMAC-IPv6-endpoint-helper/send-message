@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BIN_ROOT="${CMXSAFE_BUNDLE_BIN_ROOT:-$ROOT/bin}"
+exec "${PYTHON:-python3}" "$BIN_ROOT/bundlectl.py" send-message "$ROOT/config.json" "$@"

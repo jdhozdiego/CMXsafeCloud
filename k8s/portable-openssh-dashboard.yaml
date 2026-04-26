@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mac-ssh-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portable-openssh-dashboard
+  namespace: mac-ssh-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portable-openssh-dashboard
+  namespace: mac-ssh-demo
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portable-openssh-dashboard
+  namespace: mac-ssh-demo
+subjects:
+  - kind: ServiceAccount
+    name: portable-openssh-dashboard
+    namespace: mac-ssh-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portable-openssh-dashboard
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portable-openssh-dashboard
+  namespace: mac-ssh-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: portable-openssh-dashboard
+  template:
+    metadata:
+      labels:
+        app: portable-openssh-dashboard
+    spec:
+      serviceAccountName: portable-openssh-dashboard
+      containers:
+        - name: dashboard
+          image: cmxsafemac-ipv6-ssh-dashboard:docker-desktop-v16
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8084
+              name: http
+          env:
+            - name: PORT
+              value: "8084"
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: portable-openssh-dashboard-postgres
+                  key: DB_HOST
+            - name: DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: portable-openssh-dashboard-postgres
+                  key: DB_PORT
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: portable-openssh-dashboard-postgres
+                  key: DB_NAME
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: portable-openssh-dashboard-postgres
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: portable-openssh-dashboard-postgres
+                  key: DB_PASSWORD
+            - name: SSH_DASHBOARD_BOOTSTRAP_SAMPLE
+              value: "true"
+            - name: SSH_DASHBOARD_SAMPLE_TARGET_NAME
+              value: portable-openssh-busybox
+            - name: SSH_DASHBOARD_SAMPLE_NAMESPACE
+              value: mac-ssh-demo
+            - name: SSH_DASHBOARD_SAMPLE_WORKLOAD_KIND
+              value: Deployment
+            - name: SSH_DASHBOARD_SAMPLE_WORKLOAD_NAME
+              value: portable-openssh-busybox
+            - name: SSH_DASHBOARD_SAMPLE_WORKLOAD_SELECTOR
+              value: app=portable-openssh-busybox
+            - name: SSH_DASHBOARD_SAMPLE_ACCOUNT_ROOT
+              value: /mnt/targets/portable-openssh/etc
+            - name: SSH_DASHBOARD_SAMPLE_HOME_ROOT
+              value: /mnt/targets/portable-openssh/home
+            - name: SSH_DASHBOARD_SAMPLE_RUNTIME_ROOT
+              value: /mnt/targets/portable-openssh/runtime
+            - name: SSH_DASHBOARD_SAMPLE_SSH_CONFIGMAP
+              value: portable-openssh-etc
+            - name: SSH_DASHBOARD_SAMPLE_SSH_CONFIGMAP_KEY
+              value: sshd_config
+            - name: SSH_DASHBOARD_SAMPLE_CANONICAL_GATEWAY_MAC
+              value: f6:db:2b:39:78:94
+            - name: SSH_DASHBOARD_DEFAULT_POLICY_NAME
+              value: forwarding-default
+            - name: SSH_DASHBOARD_DEFAULT_FORCE_COMMAND
+              value: /opt/ssh-policy/forward-only.sh
+          volumeMounts:
+            - name: openssh-etc
+              mountPath: /mnt/targets/portable-openssh/etc
+            - name: ssh-home
+              mountPath: /mnt/targets/portable-openssh/home
+            - name: openssh-runtime
+              mountPath: /mnt/targets/portable-openssh/runtime
+              readOnly: true
+      volumes:
+        - name: openssh-etc
+          persistentVolumeClaim:
+            claimName: portable-openssh-etc
+        - name: ssh-home
+          persistentVolumeClaim:
+            claimName: portable-openssh-home
+        - name: openssh-runtime
+          persistentVolumeClaim:
+            claimName: portable-openssh-runtime
+            readOnly: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portable-openssh-dashboard
+  namespace: mac-ssh-demo
+spec:
+  selector:
+    app: portable-openssh-dashboard
+  ports:
+    - name: http
+      port: 8084
+      targetPort: http

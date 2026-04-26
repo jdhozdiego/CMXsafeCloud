@@ -1,0 +1,403 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mac-allocator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: net-identity-allocator
+  namespace: mac-allocator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cmxsafemac-ipv6-node-agent
+  namespace: mac-allocator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: net-identity-allocator
+  namespace: mac-allocator
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: net-identity-allocator
+  namespace: mac-allocator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: net-identity-allocator
+subjects:
+  - kind: ServiceAccount
+    name: net-identity-allocator
+    namespace: mac-allocator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cmxsafemac-ipv6-node-agent
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cmxsafemac-ipv6-node-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cmxsafemac-ipv6-node-agent
+subjects:
+  - kind: ServiceAccount
+    name: cmxsafemac-ipv6-node-agent
+    namespace: mac-allocator
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: net-identity-allocator-postgres
+  namespace: mac-allocator
+spec:
+  clusterIP: None
+  selector:
+    app: net-identity-allocator-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: net-identity-allocator-postgres
+  namespace: mac-allocator
+spec:
+  serviceName: net-identity-allocator-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: net-identity-allocator-postgres
+  template:
+    metadata:
+      labels:
+        app: net-identity-allocator-postgres
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: net-identity-allocator
+  namespace: mac-allocator
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: net-identity-allocator
+  template:
+    metadata:
+      labels:
+        app: net-identity-allocator
+    spec:
+      serviceAccountName: net-identity-allocator
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - until pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do sleep 2; done
+          env:
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_HOST
+            - name: POSTGRES_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_USER
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: allocator
+          image: net-identity-allocator:docker-desktop-v12
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: ALLOCATOR_HTTP_PORT
+              value: "8080"
+            - name: NODE_AGENT_NAMESPACE
+              value: mac-allocator
+            - name: NODE_AGENT_LABEL_SELECTOR
+              value: app=cmxsafemac-ipv6-node-agent
+            - name: NODE_AGENT_HTTP_PORT
+              value: "8081"
+            - name: AUTO_MANAGED_EXPLICIT_TAG
+              value: "fd00"
+            - name: CANONICAL_GATEWAY_MAC
+              value: f6:db:2b:39:78:94
+            - name: EXPLICIT_APPLY_WORKERS
+              value: "42"
+            - name: EXPLICIT_MOVE_DISPATCH_SHARDS
+              value: "2"
+            - name: EXPLICIT_MOVE_BATCH_MAX_ITEMS
+              value: "64"
+            - name: EXPLICIT_MOVE_MIN_BATCH_ITEMS
+              value: "32"
+            - name: EXPLICIT_MOVE_BATCH_WINDOW_MS
+              value: "5"
+            - name: EXPLICIT_APPLY_BATCH_WINDOW_MS
+              value: "5"
+            - name: EXPLICIT_APPLY_BATCH_MAX_ITEMS
+              value: "128"
+            - name: ALLOCATOR_REQUEST_QUEUE_SIZE
+              value: "4096"
+            - name: DB_POOL_MIN_SIZE
+              value: "3"
+            - name: DB_POOL_MAX_SIZE
+              value: "32"
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_HOST
+            - name: POSTGRES_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_SSLMODE
+              valueFrom:
+                secretKeyRef:
+                  name: net-identity-allocator-postgres
+                  key: POSTGRES_SSLMODE
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: net-identity-allocator
+  namespace: mac-allocator
+spec:
+  selector:
+    app: net-identity-allocator
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cmxsafemac-ipv6-node-agent
+  namespace: mac-allocator
+spec:
+  selector:
+    matchLabels:
+      app: cmxsafemac-ipv6-node-agent
+  template:
+    metadata:
+      labels:
+        app: cmxsafemac-ipv6-node-agent
+    spec:
+      serviceAccountName: cmxsafemac-ipv6-node-agent
+      hostPID: true
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: agent
+          image: cmxsafemac-ipv6-node-agent:docker-desktop-v23
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8081
+              name: http-agent
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: ALLOCATOR_URL
+              value: http://net-identity-allocator.mac-allocator.svc.cluster.local:8080
+            - name: GW_IFACE
+              value: eth0
+            - name: MANAGED_IFACE
+              value: eth0
+            - name: EXPLICIT_IFACE
+              value: net1
+            - name: MANAGED_IPV6_PREFIX
+              value: fd42:4242:4242:10::/64
+            - name: AUTO_MANAGED_EXPLICIT_TAG
+              value: "fd00"
+            - name: SELECTOR_KEY
+              value: pods-mac-allocator/enabled
+            - name: SELECTOR_VALUE
+              value: "true"
+            - name: HOST_SYS_PATH
+              value: /host-sys
+            - name: CONTAINER_RUNTIME_ENDPOINT
+              value: unix:///host-run/containerd/containerd.sock
+            - name: TETRAGON_GRPC_ADDRESS
+              value: unix:///var/run/cilium/tetragon/tetragon.sock
+            - name: STREAM_RESTART_SECONDS
+              value: "3"
+            - name: SAFETY_RECONCILE_SECONDS
+              value: "15"
+            - name: AGENT_HTTP_PORT
+              value: "8081"
+            - name: AGENT_REQUEST_QUEUE_SIZE
+              value: "4096"
+            - name: EXPLICIT_IPV6_ROUTE_PREFIX_LEN
+              value: "16"
+            - name: EXPLICIT_OP_BATCH_WINDOW_MS
+              value: "5"
+            - name: EXPLICIT_OP_BATCH_MAX_COMMANDS
+              value: "256"
+            - name: EXPLICIT_POD_BATCH_SHARDS
+              value: "4"
+            - name: EXPLICIT_MOVE_SUBBATCH_MAX_ITEMS
+              value: "256"
+            - name: EXPLICIT_MOVE_SUBBATCH_WORKERS
+              value: "1"
+            - name: EXPLICIT_BULK_MOVE_BROAD_FLUSH_THRESHOLD
+              value: "128"
+            - name: ASYNC_APPLIED_CALLBACK_ENABLED
+              value: "true"
+            - name: APPLIED_CALLBACK_BATCH_WINDOW_MS
+              value: "10"
+            - name: APPLIED_CALLBACK_BATCH_MAX_ITEMS
+              value: "256"
+            - name: APPLIED_CALLBACK_WORKERS
+              value: "4"
+          volumeMounts:
+            - name: host-sys
+              mountPath: /host-sys
+              readOnly: true
+            - name: host-run-containerd
+              mountPath: /host-run/containerd
+              readOnly: true
+            - name: host-run-tetragon
+              mountPath: /var/run/cilium/tetragon
+              readOnly: true
+      volumes:
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-run-containerd
+          hostPath:
+            path: /run/containerd
+            type: Directory
+        - name: host-run-tetragon
+          hostPath:
+            path: /var/run/cilium/tetragon
+            type: Directory
