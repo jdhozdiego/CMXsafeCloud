@@ -16,6 +16,9 @@ The way it achieves that is by tying one logical identity across:
 - SSH usernames derived from those canonical IPv6 identities
 - `authorized_keys` policy and forced-command hooks that ensure the canonical IPv6 is active on the replica currently hosting the SSH session
 
+![Screenshot](images/observer.png)
+
+
 ## Problem First
 
 With one SSH replica, local forwarding and reverse forwarding can rendezvous through one shared `sshd` instance.
@@ -406,3 +409,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\serve-docs-site.ps1
 The GitHub Pages deployment workflow lives in:
 
 - [./.github/workflows/docs-site.yml](./.github/workflows/docs-site.yml)
+
+> **Funding Acknowledgment**  
+> This work was supported by the European Union’s Horizon Europe research and innovation programme under the Marie Skłodowska-Curie Actions grant agreement No. 101149974 ([Project CMXsafe](https://cordis.europa.eu/project/id/101149974)).
+
