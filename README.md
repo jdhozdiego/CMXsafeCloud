@@ -1,4 +1,4 @@
-# CMXsafeMAC-IPv6
+# CMXsafeCloud
 
 CMXsafeMAC-IPv6 is an identity-and-rendezvous system for OpenSSH in replicated Kubernetes environments.
 
